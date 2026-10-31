@@ -3,7 +3,7 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import * as THREE from 'three';
-  import { MagnifyingGlass, X, SpeakerSlash, SpeakerHigh, Plus, Minus, GameController, CaretLeft, CaretRight } from 'phosphor-svelte';
+  import { MagnifyingGlass, X, SpeakerSlash, SpeakerHigh, Plus, Minus, GameController, CaretLeft, CaretRight, CheckCircle } from 'phosphor-svelte';
   import {
     AI_DEFAULT_COLORS,
     AI_DEFAULT_NAMES,
@@ -13,18 +13,19 @@
     LS,
     SLOTS,
     clamp,
+    defaultState,
     fmt,
     imageKey,
     imageSrc,
-    imageURLs,
     loadCart,
     loadStore,
     productImages,
     safeUrl,
     saveCartData,
-    saveStoreData,
     uid
   } from '#lib/breathe.js';
+    import { div } from 'three/tsl';
+    import { supabase } from '#lib/supabase.js';
 
   /* =========================================================
      CONSTANTS
@@ -50,20 +51,6 @@
   /* =========================================================
      UTILITIES
      ========================================================= */
-  /* Uploaded images live in IndexedDB. The 3D store reads them synchronously
-     from imageURLs, so every uploaded image must be resolved to an object URL
-     BEFORE the scene is built (previously only the admin UI did this). */
-  async function preloadStoreImages() {
-    const list = [];
-    const add = (im) => { if (im && im.kind === 'upload') list.push(im); };
-    for (const p of store.products || []) {
-      add(p.image); (p.images || []).forEach(add);
-      if (p.draft) { add(p.draft.image); (p.draft.images || []).forEach(add); }
-    }
-    for (const b of store.banners || []) add(b.image);
-    await Promise.all(list.map((im) => imageSrc(im).catch(() => null)));
-  }
-
   /* Wait (briefly) for a texture's image to finish loading. */
   function whenTextureReady(image, cb) {
     let tries = 0;
@@ -76,7 +63,13 @@
     }, 150);
   }
 
-  let store = $state(loadStore());
+  /* The catalogue normally arrives from +page.js. If it is missing or malformed, the page
+     loads it itself in onMount, so the 3D scene never starts with an undefined store. */
+  const validStore = (s) => !!(s && s.layout && Array.isArray(s.products) && Array.isArray(s.categories) && Array.isArray(s.banners));
+  let { data } = $props();
+  let loadError = $state('');
+  // svelte-ignore state_referenced_locally
+  let store = $state(validStore(data?.store) ? data.store : defaultState());
   let cart = $state(loadCart());
   let mode = $state('welcome');
   let activeSheet = $state(null);
@@ -155,7 +148,13 @@
 
   let handleCursor = Math.floor(Math.random() * 64);
 
-  function saveStore() { saveStoreData($state.snapshot(store)); }
+  const progress = $state({
+    text: 'Starting off',
+    perc: 0
+  })
+
+  /* The catalogue is saved by the admin only. Orders will move to their own tables later. */
+  function saveStore() {}
   function saveCartState() { saveCartData($state.snapshot(cart)); }
   function saveSession() { if (player) LS.set(K_SESSION, { x: player.pos.x, z: player.pos.z, yaw: player.yaw, pitch: player.pitch }); }
 
@@ -175,7 +174,7 @@
     if (!image || image.kind === 'none') return null;
     const key = imageKey(image);
     if (texCache.has(key)) return texCache.get(key);
-    const src = image.kind === 'upload' ? imageURLs.get(image.id) : image.url;
+    const src = image.url;
     if (!src) { texCache.set(key, null); return null; }
     let tex = null;
     try {
@@ -1100,7 +1099,7 @@
     el.className = 'fixed z-[130] w-14 h-14 rounded-2xl bg-white flex items-center justify-center text-2xl pointer-events-none shadow-2xl';
     el.style.transition = 'transform .6s cubic-bezier(.55,0,.25,1), opacity .6s ease';
     const imgs = productImages(p);
-    const src = imgs[0] && (imgs[0].kind === 'upload' ? imageURLs.get(imgs[0].id) : imgs[0].url);
+    const src = imgs[0]?.url;
     if (src) el.style.backgroundImage = `url("${String(src).replace(/"/g, '%22')}")`, el.style.backgroundSize = '72%', el.style.backgroundRepeat = 'no-repeat', el.style.backgroundPosition = 'center';
     else el.textContent = '🛒';
     el.style.left = (window.innerWidth / 2 - 28) + 'px';
@@ -1185,11 +1184,43 @@
     });
     return problems;
   }
-  function startCheckout() {
-    if (!cart.lines.length) { toast('Your cart is empty'); openSheet('cartSheet'); return; }
-    openSheet('billSheet');
+
+  async function createOrder() {
+    const order_items = cart.lines.map(c => {
+      return {
+        product_id: c.productId,
+        qty: c.qty
+      }
+    })
+
+    console.log(cart)
+
+    const orderId = 'RBB-' + Date.now().toString(36).toUpperCase().slice(-6) + '-' + Math.floor(Math.random() * 900 + 100)
+
+    const orderReq = await supabase.from('orders').insert({
+      id: orderId,
+      status: 'pending',
+      user_id: data.profile.id
+    }).select().single()
+
+    if (orderReq.error) throw orderReq
+
   }
-  function goToPayment() { closeSheet('billSheet'); openSheet('paySheet'); }
+
+  async function startCheckout() {
+    if (!cart.lines.length) { toast('Your cart is empty'); openSheet('cartSheet'); return; }
+    
+    await createOrder()
+    clearCart()
+
+    openSheet('receiptSheet')
+  
+
+  }
+  function goToPayment() { 
+    closeSheet('billSheet')
+    console.log(cart)
+  }
   function runPayment(success) {
     setTimeout(() => {
       if (!success) return;
@@ -1687,9 +1718,33 @@
   /* =========================================================
      LIFECYCLE
      ========================================================= */
+
+    const increaseProgress = (limit = 100, speed = 0.1) => {
+        progress.perc = (progress.perc || 0) + (limit - (progress.perc || 0)) * speed;
+        if (!threeReady) setTimeout(increaseProgress, 50);
+        console.log(progress.perc)
+    };
+
   onMount(() => {
     let cancelled = false;
-    preloadStoreImages().catch(() => {}).finally(() => { if (!cancelled) initThree(); });
+    (async () => {
+      if (!validStore(data?.store)) {
+        try {
+          progress.text = 'Getting store ready'
+        
+          increaseProgress()
+          const s = await loadStore();
+          if (!validStore(s)) throw new Error('The store data from the server is incomplete.');
+          store = s;
+            progress.text = 'All set'
+        } catch (e) {
+          loadError = e?.message || 'Could not load the store.';
+          progress.text = 'Something went wrong'
+          return;
+        }
+      }
+      if (!cancelled) initThree();
+    })();
     return () => {
       cancelled = true;
       if (rafId) cancelAnimationFrame(rafId);
@@ -1759,15 +1814,14 @@
 {#if threeReady && mode === 'play'}
   <div class="fixed inset-0 pointer-events-none z-20">
     <div class="absolute top-0 left-0 right-0 flex items-center gap-2 pt-[calc(env(safe-area-inset-top,0px)+10px)] px-3 pb-2.5 pointer-events-auto">
-      <button onclick={backToWelcome} class="font-bold text-[15px] tracking-tight text-white px-3.5 py-2 rounded-xl bg-[#0f1416]/85 border border-white/20 backdrop-blur-md active:bg-[#1f6b57]/90">Breathe</button>
       <div class="flex-1"></div>
       <button onclick={openSearch} class="w-10 h-10 rounded-full bg-[#14181a]/60 border border-white/15 text-white flex items-center justify-center backdrop-blur-md" aria-label="Search"><MagnifyingGlass size={18} /></button>
       <button onclick={() => { const on = !Audio.isOn(); Audio.setEnabled(on); store.settings.muted = !on; saveStore(); }} class="w-10 h-10 rounded-full bg-[#14181a]/60 border border-white/15 text-white flex items-center justify-center backdrop-blur-md" aria-label="Sound">
         {#if Audio.isOn()}<SpeakerHigh size={18} />{:else}<SpeakerSlash size={18} />{/if}
       </button>
       <button id="cartPill" onclick={() => openSheet('cartSheet')} class="flex items-center gap-2 rounded-full px-3.5 py-2 text-[12.5px] font-bold text-white border border-white/20 bg-[#14181a]/75 backdrop-blur-md">
-        <span class="bg-[#1f6b57] rounded-full px-1.5 py-px text-[11.5px]">{cartCount}</span>
-        <span>{fmt(cartTotal)}</span>
+        <span class="bg-black rounded-full px-1.5 py-px text-[11.5px]">{cartCount}</span>
+        <span>{cartTotal > 0? 'Checkout' : 'Empty Cart'}</span>
       </button>
     </div>
     <div class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-2 h-2 rounded-full border-2 border-white/75 shadow pointer-events-none transition-all duration-200"
@@ -1794,20 +1848,19 @@
 {#if mode === 'welcome'}
   <div class="fixed inset-0 z-[60] flex flex-col justify-end px-[22px] pb-[calc(30px+env(safe-area-inset-bottom,0px))] pt-[26px]"
        style="background:radial-gradient(120% 70% at 50% 100%,rgba(10,40,32,.92) 0%,rgba(8,12,12,.55) 55%,rgba(8,10,10,.08) 100%)">
-    <div class="font-extrabold text-[56px] tracking-[-.04em] text-white leading-none" style="font-family:'Bricolage Grotesque',sans-serif">Breathe</div>
+    <div class="text-[36px] tracking-[-.04em] text-white leading-none font-medium">Robbin'</div>
     <p class="text-white/78 text-[14.5px] mt-2 mb-[22px] max-w-[340px]">
-      A calmer way to shop. Walk the aisles, pick up what you need, and check out — all inside your browser.
+      A pit stop to your next steal - Everything is legal. Relax...
     </p>
     <div class="flex flex-col gap-2.5 max-w-[420px]">
       {#if cart.lines.length > 0}
-        <button onclick={() => enterStore(true)} class="rounded-[14px] px-5 py-4 text-[15.5px] font-bold text-white" style="background:linear-gradient(180deg,#27806a,#1b5e4d);box-shadow:0 6px 18px rgba(31,107,87,.35)">Resume Shopping</button>
-        <button onclick={() => enterStore(false)} class="rounded-[14px] px-5 py-4 text-[15.5px] font-bold text-white border border-white/35 bg-white/10 backdrop-blur-md">Start New Trip</button>
+        <button onclick={() => enterStore(true)} class="rounded-[14px] px-3 py-2 text-[15.5px] font-bold text-white border border-white/35 bg-black/20 backdrop-blur-md">Resume Shopping</button>
+        <button onclick={() => enterStore(false)} class="rounded-[14px] px-3 py-2 text-[15.5px] font-bold text-white border border-white/35 bg-white/10 backdrop-blur-md">Start New Trip</button>
       {:else}
-        <button onclick={() => enterStore(false)} class="rounded-[14px] px-5 py-4 text-[15.5px] font-bold text-white border border-white/35 bg-white/10 backdrop-blur-md">Enter Store</button>
+        <button onclick={() => enterStore(false)} class="rounded-[14px] px-3 py-2 text-[15.5px] font-bold text-white border border-white/35 bg-black/20 backdrop-blur-md">Enter Store</button>
       {/if}
-      <button onclick={() => goto('/admin')} class="rounded-[14px] px-5 py-3 text-[15px] font-bold text-white/85 border border-white/35 bg-white/5">Admin Panel</button>
     </div>
-    <p class="text-[11px] text-white/45 mt-4">Local browser prototype · simulated payment only · no real transactions</p>
+    <p class="text-[11px] text-white/45 mt-4"></p>
   </div>
 {/if}
 
@@ -1820,17 +1873,17 @@
     <div class="fixed inset-0 z-[120] flex items-end md:items-center justify-center bg-[#090c0c]/42 backdrop-blur-sm" onclick={() => closeSheet('productCard')}>
       <div class="w-full max-w-[520px] max-h-[90vh] overflow-auto bg-white rounded-t-[20px] md:rounded-[20px] p-[18px] pb-[calc(18px+env(safe-area-inset-bottom,0px))] md:pb-[18px]" onclick={(e) => e.stopPropagation()}>
         <div class="flex items-center gap-2.5 mb-3.5">
-          <h2 class="text-[17px] m-0 font-bold tracking-tight" style="font-family:'Bricolage Grotesque',sans-serif">Product</h2>
+          <h2 class="text-[17px] m-0 font-bold tracking-tight" style="">Product</h2>
           <div class="flex-1"></div>
           <button onclick={() => closeSheet('productCard')} class="w-8 h-8 rounded-full border border-[#e3e7e4] bg-white flex items-center justify-center text-[#5a6662]"><X size={16} /></button>
         </div>
 
         <!-- image carousel -->
-        <div class="relative w-full h-[260px] rounded-[14px] overflow-hidden mb-3.5" style="background:radial-gradient(circle at 50% 35%,#fff,#e3eee8)">
+        <div class="relative w-full h-[150px] rounded-[14px] overflow-hidden mb-3.5">
           {#if cardImages.length}
             {#await imageSrc(cardImages[safeIdx]) then src}
               {#if src}
-                <img src={src} alt={p.name} class="absolute inset-0 w-full h-full object-contain p-3" />
+                <img src={src} alt={p.name} class="absolute inset-0 w-full h-full object-contain p-3 rounded-[28px]" />
               {:else}
                 <span class="absolute inset-0 grid place-items-center text-3xl opacity-35">🛍️</span>
               {/if}
@@ -1864,17 +1917,16 @@
           {/if}
         </div>
 
-        <h3 class="text-[19px] font-bold tracking-tight m-0 mb-[3px]" style="font-family:'Bricolage Grotesque',sans-serif">{p.name}</h3>
+        <h3 class="text-[19px] font-bold tracking-tight m-0 mb-[3px]" style="">{p.name}</h3>
         <p class="text-[12.5px] text-[#5a6662] m-0 mb-3.5">{p.brand || '—'} · {cat?.name || 'Uncategorised'}</p>
-        <p class="text-[23px] font-extrabold tracking-tight m-0 mb-4 text-[#1f6b57]" style="font-family:'Bricolage Grotesque',sans-serif">{fmt(p.price)}</p>
+        <p class="text-[23px] font-extrabold tracking-tight m-0 mb-4 text-green-600" style="">{fmt(p.price)}</p>
         <div class="flex items-stretch border border-[#e3e7e4] rounded-xl overflow-hidden mb-3.5">
           <button onclick={() => cardQty = Math.max(1, cardQty - 1)} class="w-11 h-11 bg-white text-[19px] font-semibold text-[#14181a] active:bg-[#f2f4f2]"><Minus size={16} class="inline" /></button>
           <div class="flex-1 text-center font-bold text-[15px] flex items-center justify-center">{cardQty}</div>
           <button onclick={() => cardQty = Math.min(99, cardQty + 1)} class="w-11 h-11 bg-white text-[19px] font-semibold text-[#14181a] active:bg-[#f2f4f2]"><Plus size={16} class="inline" /></button>
         </div>
         <button onclick={() => { addToCart(p, cardQty); closeSheet('productCard'); }}
-                class="w-full rounded-xl px-4 py-3 text-[14.5px] font-bold text-white"
-                style="background:linear-gradient(180deg,#27806a,#1b5e4d);box-shadow:0 6px 18px rgba(31,107,87,.35)">
+                class="w-full rounded-xl px-4 py-3 text-[14.5px] bg-black font-bold text-white">
           Add to Cart
         </button>
       </div>
@@ -1887,7 +1939,7 @@
   <div class="fixed inset-0 z-[120] flex items-end md:items-center justify-center bg-[#090c0c]/42 backdrop-blur-sm" onclick={() => closeSheet('cartSheet')}>
     <div class="w-full max-w-[520px] max-h-[90vh] overflow-auto bg-white rounded-t-[20px] md:rounded-[20px] p-[18px] pb-[calc(18px+env(safe-area-inset-bottom,0px))] md:pb-[18px]" onclick={(e) => e.stopPropagation()}>
       <div class="flex items-center gap-2.5 mb-3.5">
-        <h2 class="text-[17px] m-0 font-bold" style="font-family:'Bricolage Grotesque',sans-serif">Your cart</h2>
+        <h2 class="text-[17px] m-0 font-bold" style="">Your cart</h2>
         <div class="flex-1"></div>
         <button onclick={() => closeSheet('cartSheet')} class="w-8 h-8 rounded-full border border-[#e3e7e4] bg-white flex items-center justify-center text-[#5a6662]"><X size={16} /></button>
       </div>
@@ -1914,9 +1966,9 @@
           </div>
         {/each}
         <div class="flex justify-between py-1.5 text-[14px] mt-3"><span>Subtotal</span><span>{fmt(cartTotal)}</span></div>
-        <div class="flex justify-between py-3 text-[17px] font-extrabold border-t border-[#e3e7e4] mt-2" style="font-family:'Bricolage Grotesque',sans-serif"><span>Total</span><span>{fmt(cartTotal)}</span></div>
+        <div class="flex justify-between py-3 text-[17px] font-extrabold border-t border-[#e3e7e4] mt-2" style=""><span>Total</span><span class="text-green-600">{fmt(cartTotal)}</span></div>
         <div class="flex flex-col gap-2.5 mt-4">
-          <button onclick={() => { closeSheet('cartSheet'); startCheckout(); }} class="w-full rounded-xl px-4 py-3 text-[14.5px] font-bold text-white" style="background:linear-gradient(180deg,#27806a,#1b5e4d);box-shadow:0 6px 18px rgba(31,107,87,.35)">Checkout</button>
+          <button onclick={() => { closeSheet('cartSheet'); startCheckout(); }} class="w-full rounded-xl px-4 py-3 text-[14.5px] font-bold text-white bg-black" >Checkout</button>
           <button onclick={() => closeSheet('cartSheet')} class="w-full rounded-xl border border-[#e3e7e4] bg-white px-4 py-2.5 text-[14px] font-semibold text-[#14181a]">Continue Shopping</button>
         </div>
       {/if}
@@ -1929,7 +1981,7 @@
   <div class="fixed inset-0 z-[120] flex items-end md:items-center justify-center bg-[#090c0c]/42 backdrop-blur-sm" onclick={() => closeSheet('searchSheet')}>
     <div class="w-full max-w-[520px] max-h-[90vh] overflow-auto bg-white rounded-t-[20px] md:rounded-[20px] p-[18px] pb-[calc(18px+env(safe-area-inset-bottom,0px))] md:pb-[18px]" onclick={(e) => e.stopPropagation()}>
       <div class="flex items-center gap-2.5 mb-3.5">
-        <h2 class="text-[17px] m-0 font-bold" style="font-family:'Bricolage Grotesque',sans-serif">Find a product</h2>
+        <h2 class="text-[17px] m-0 font-bold" style="">Find a product</h2>
         <div class="flex-1"></div>
         <button onclick={() => closeSheet('searchSheet')} class="w-8 h-8 rounded-full border border-[#e3e7e4] bg-white flex items-center justify-center text-[#5a6662]"><X size={16} /></button>
       </div>
@@ -1974,7 +2026,7 @@
   <div class="fixed inset-0 z-[120] flex items-end md:items-center justify-center bg-[#090c0c]/42 backdrop-blur-sm" onclick={() => closeSheet('billSheet')}>
     <div class="w-full max-w-[520px] max-h-[90vh] overflow-auto bg-white rounded-t-[20px] md:rounded-[20px] p-[18px] pb-[calc(18px+env(safe-area-inset-bottom,0px))] md:pb-[18px]" onclick={(e) => e.stopPropagation()}>
       <div class="flex items-center gap-2.5 mb-3.5">
-        <h2 class="text-[17px] m-0 font-bold" style="font-family:'Bricolage Grotesque',sans-serif">Checkout</h2>
+        <h2 class="text-[17px] m-0 font-bold" style="">Checkout</h2>
         <div class="flex-1"></div>
         <button onclick={() => closeSheet('billSheet')} class="w-8 h-8 rounded-full border border-[#e3e7e4] bg-white flex items-center justify-center text-[#5a6662]"><X size={16} /></button>
       </div>
@@ -1995,9 +2047,9 @@
           </div>
         {/each}
         <div class="flex justify-between py-1.5 text-[14px]"><span>Subtotal</span><span>{fmt(cartTotal)}</span></div>
-        <div class="flex justify-between py-3 text-[17px] font-extrabold border-t border-[#e3e7e4] mt-2" style="font-family:'Bricolage Grotesque',sans-serif"><span>Total payable</span><span>{fmt(cartTotal)}</span></div>
+        <div class="flex justify-between py-3 text-[17px] font-extrabold border-t border-[#e3e7e4] mt-2" style=""><span>Total payable</span><span>{fmt(cartTotal)}</span></div>
         <div class="flex flex-col gap-2.5 mt-4">
-          <button onclick={goToPayment} class="w-full rounded-xl px-4 py-3 text-[14.5px] font-bold text-white" style="background:linear-gradient(180deg,#27806a,#1b5e4d);box-shadow:0 6px 18px rgba(31,107,87,.35)">Proceed to Payment</button>
+          <button onclick={goToPayment} class="w-full rounded-xl px-4 py-3 text-[14.5px] font-bold text-white" style="background:linear-gradient(180deg,#27806a,#1b5e4d);box-shadow:0 6px 18px rgba(31,107,87,.35)">Continue</button>
           <button onclick={() => closeSheet('billSheet')} class="w-full rounded-xl border border-[#e3e7e4] bg-white px-4 py-2.5 text-[14px] font-semibold text-[#14181a]">Back</button>
         </div>
       {/if}
@@ -2010,7 +2062,7 @@
   <div class="fixed inset-0 z-[120] flex items-end md:items-center justify-center bg-[#090c0c]/42 backdrop-blur-sm" onclick={() => closeSheet('paySheet')}>
     <div class="w-full max-w-[520px] max-h-[90vh] overflow-auto bg-white rounded-t-[20px] md:rounded-[20px] p-[18px] pb-[calc(18px+env(safe-area-inset-bottom,0px))] md:pb-[18px]" onclick={(e) => e.stopPropagation()}>
       <div class="flex items-center gap-2.5 mb-3.5">
-        <h2 class="text-[17px] m-0 font-bold" style="font-family:'Bricolage Grotesque',sans-serif">Payment</h2>
+        <h2 class="text-[17px] m-0 font-bold" style="">Payment</h2>
         <div class="flex-1"></div>
         <button onclick={() => closeSheet('paySheet')} class="w-8 h-8 rounded-full border border-[#e3e7e4] bg-white flex items-center justify-center text-[#5a6662]"><X size={16} /></button>
       </div>
@@ -2018,7 +2070,7 @@
         <div class="text-[11.5px] text-[#7a5a12] font-bold">DEMONSTRATION ONLY</div>
         <div class="text-[11.5px] text-[#7a5a12]">This is a simulated payment. No real card details are collected and no money is charged.</div>
       </div>
-      <div class="flex justify-between py-3 text-[17px] font-extrabold border-t border-b border-[#e3e7e4]" style="font-family:'Bricolage Grotesque',sans-serif"><span>Amount</span><span>{fmt(cartTotal)}</span></div>
+      <div class="flex justify-between py-3 text-[17px] font-extrabold border-t border-b border-[#e3e7e4]" style=""><span>Amount</span><span>{fmt(cartTotal)}</span></div>
       <div class="mt-4 mb-3">
         <label class="block text-[11.5px] font-bold text-[#5a6662] mb-1.5 uppercase tracking-wider">Payment method</label>
         <select class="w-full px-3 py-2.5 border border-[#e3e7e4] rounded-[11px] text-[14.5px] outline-none focus:border-[#1f6b57]">
@@ -2032,24 +2084,20 @@
 {/if}
 
 <!-- ============ RECEIPT ============ -->
-{#if activeSheet === 'receiptSheet' && pendingOrder}
-  {@const o = pendingOrder}
+{#if activeSheet === 'receiptSheet'}
   {@const promoUrl = safeUrl(store.promo.url)}
   <div class="fixed inset-0 z-[120] flex items-end md:items-center justify-center bg-[#090c0c]/42 backdrop-blur-sm" onclick={() => closeSheet('receiptSheet')}>
     <div class="w-full max-w-[520px] max-h-[90vh] overflow-auto bg-white rounded-t-[20px] md:rounded-[20px] p-[18px] pb-[calc(18px+env(safe-area-inset-bottom,0px))] md:pb-[18px]" onclick={(e) => e.stopPropagation()}>
       <div class="flex items-center gap-2.5 mb-3.5">
-        <h2 class="text-[17px] m-0 font-bold" style="font-family:'Bricolage Grotesque',sans-serif">Receipt</h2>
         <div class="flex-1"></div>
         <button onclick={() => closeSheet('receiptSheet')} class="w-8 h-8 rounded-full border border-[#e3e7e4] bg-white flex items-center justify-center text-[#5a6662]"><X size={16} /></button>
       </div>
-      <div class="border border-dashed border-[#cfd6d2] rounded-[14px] p-4 mb-3.5">
-        <div class="flex justify-between items-baseline mb-2.5"><strong class="text-[15px]" style="font-family:'Bricolage Grotesque',sans-serif">Breathe</strong><span class="text-[11.5px] text-[#5a6662]">{o.id}</span></div>
-        <div class="text-[11.5px] text-[#5a6662] mb-2.5">{new Date(o.at).toLocaleString()}</div>
-        {#each o.items as it}
-          <div class="flex justify-between py-1 text-[13px]"><span>{it.qty} × {it.name}</span><span>{fmt(it.price * it.qty)}</span></div>
-        {/each}
-        <div class="flex justify-between py-3 text-[17px] font-extrabold border-t border-[#e3e7e4] mt-2" style="font-family:'Bricolage Grotesque',sans-serif"><span>Total paid</span><span>{fmt(o.total)}</span></div>
-        <div class="text-[11.5px] text-[#5a6662] mt-2.5">Simulated payment · no real money was charged.</div>
+      <div class="flex justify-center w-full">
+        <div>
+          <div class="flex justify-center"><CheckCircle size={150} weight='duotone' class='text-green-600' /></div>
+          <div class="text-[22px] text-center tracking-tight">Ready in less than 24 hours</div>
+          <div class="mb-5 text-[14px] text-center tracking-tight text-black/60">We're processing your order. We'll notify you when it's ready. Fees may apply.</div>
+        </div>
       </div>
       {#if store.promo.enabled !== false}
         <div class="border border-[#e3e7e4] rounded-[14px] p-3.5 flex gap-3 items-center bg-[#fafbfa] mb-3.5">
@@ -2059,12 +2107,12 @@
             <div class="text-[11.5px] text-[#5a6662] mt-0.5">Opens in a new tab</div>
           </div>
           <button onclick={() => { if (!promoUrl) { toast('No game link configured'); return; } window.open(promoUrl, '_blank', 'noopener,noreferrer'); }}
-                  disabled={!promoUrl} class="px-3 py-1.5 rounded-[10px] text-[12.5px] font-bold text-white disabled:opacity-40"
-                  style="background:linear-gradient(180deg,#27806a,#1b5e4d)">{store.promo.label || 'Play Game'}</button>
+                  disabled={!promoUrl} class="px-3 py-1.5 rounded-[10px] bg-black text-[12.5px] font-bold text-white disabled:opacity-40"
+                  >{store.promo.label || 'Play Game'}</button>
         </div>
       {/if}
       <div class="flex flex-col gap-2.5">
-        <button onclick={() => closeSheet('receiptSheet')} class="w-full rounded-xl px-4 py-3 text-[14.5px] font-bold text-white" style="background:linear-gradient(180deg,#27806a,#1b5e4d);box-shadow:0 6px 18px rgba(31,107,87,.35)">Continue Shopping</button>
+        <button onclick={() => closeSheet('receiptSheet')} class="w-full rounded-xl px-4 py-3 text-[14.5px] font-bold text-white bg-black">Continue Shopping</button>
         <button onclick={() => { closeSheet('receiptSheet'); startNewTrip(); toast('New trip started'); }} class="w-full rounded-xl border border-[#e3e7e4] bg-white px-4 py-2.5 text-[14px] font-semibold text-[#14181a]">Start Fresh</button>
       </div>
     </div>
@@ -2077,7 +2125,7 @@
   <div class="fixed inset-0 z-[120] flex items-end md:items-center justify-center bg-[#090c0c]/42 backdrop-blur-sm">
     <div class="w-full max-w-[520px] max-h-[90vh] overflow-auto bg-white rounded-t-[20px] md:rounded-[20px] p-[18px] pb-[calc(18px+env(safe-area-inset-bottom,0px))] md:pb-[18px]">
       <div class="flex items-center gap-2.5 mb-3.5">
-        <h2 class="text-[17px] m-0 font-bold" style="font-family:'Bricolage Grotesque',sans-serif">Quick tour</h2>
+        <h2 class="text-[17px] m-0 font-bold" style="">Quick tour</h2>
         <div class="flex-1"></div>
         <button onclick={() => { LS.set(K_TUT, true); closeSheet('tutorial'); }} class="w-8 h-8 rounded-full border border-[#e3e7e4] bg-white flex items-center justify-center text-[#5a6662]"><X size={16} /></button>
       </div>
@@ -2105,8 +2153,19 @@
 {/if}
 
 {#if !threeReady}
-  <div class="fixed inset-0 z-[150] bg-[#0f1112] text-white flex flex-col items-center justify-center gap-4 text-[14px] tracking-widest uppercase">
-    <div class="w-[30px] h-[30px] rounded-full border-[3px] border-white/20 border-t-[#7ee0b8] animate-spin"></div>
-    Loading Breathe…
+  <div class="fixed inset-0 z-[150] bg-[#fff] text-black flex flex-col items-center justify-center gap-4 text-[14px] ">
+    {#if loadError}
+      <div class="max-w-[320px] text-center normal-case tracking-normal leading-snug px-4">
+        <div class="font-bold mb-1">Could not load the store</div>
+        <div class="text-white/70 text-[13px] mb-4">{loadError}</div>
+        <button onclick={() => location.reload()} class="px-4 py-2 rounded-[10px] bg-white text-[#14181a] text-[13px] font-bold">Try again</button>
+      </div>
+    {:else}
+      <div class="w-[250px] overflow-hidden bg-black/10 mb-5" style="border-radius: 30px;">
+        <div class={`bg-black h-2 transition-all`} style={`width: ${progress.perc}%`}></div>
+      </div>
+      <span class="text-[26px] tracking-tight text-center px-4">Preparing your Robbin' experience</span>
+      <span class="text-[14px] tracking-tight text-center px-4">{progress.text}</span>
+    {/if}
   </div>
 {/if}

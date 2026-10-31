@@ -1,12 +1,12 @@
 /* src/lib/breathe.js
    ------------------------------------------------------------------
    Shared data layer for the store page (/) and the admin page (/admin).
-   Everything that reads or writes catalogue, cart or image data lives here,
-   so the server migration only has to replace the internals of these
-   functions (loadStore, saveStoreData, ImgDB / imageSrc) with API calls.
+   READS  : loadStore() reads the tables straight from Supabase (public key, protected by RLS).
+   WRITES : saveStore() posts to /api/store, which checks the admin token and uses the service role.
+   IMAGES : an image is just a url string stored in the `attachments` table.
    ------------------------------------------------------------------ */
+import { supabase } from '#lib/supabase.js';
 
-export const K_STORE = 'breathe.store.v1';
 export const K_CART = 'breathe.cart.v1';
 export const K_TUT = 'breathe.tutorial.v1';
 export const K_SESSION = 'breathe.session.v1';
@@ -87,80 +87,16 @@ export const LS = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } }
 };
 
-/* ---------- IndexedDB image store ---------- */
-export const ImgDB = (() => {
-  let ready = null; const mem = new Map();
-  function open() {
-    if (ready) return ready;
-    ready = new Promise((resolve) => {
-      let req;
-      try { req = indexedDB.open('breathe-db', 1); } catch { return resolve(null); }
-      req.onupgradeneeded = () => {
-        const db = req.result;
-        if (!db.objectStoreNames.contains('images')) db.createObjectStore('images', { keyPath: 'id' });
-      };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => resolve(null);
-    });
-    return ready;
-  }
-  async function put(id, blob) {
-    const db = await open();
-    if (!db) { mem.set(id, { id, blob, mime: blob.type }); return; }
-    return new Promise((res, rej) => {
-      const tx = db.transaction('images', 'readwrite');
-      tx.objectStore('images').put({ id, blob, mime: blob.type, at: Date.now() });
-      tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
-    });
-  }
-  async function get(id) {
-    const db = await open();
-    if (!db) return mem.get(id) || null;
-    return new Promise((res) => {
-      const tx = db.transaction('images', 'readonly');
-      const rq = tx.objectStore('images').get(id);
-      rq.onsuccess = () => res(rq.result || null); rq.onerror = () => res(null);
-    });
-  }
-  async function all() {
-    const db = await open();
-    if (!db) return Array.from(mem.values());
-    return new Promise((res) => {
-      const tx = db.transaction('images', 'readonly');
-      const rq = tx.objectStore('images').getAll();
-      rq.onsuccess = () => res(rq.result || []); rq.onerror = () => res([]);
-    });
-  }
-  async function del(id) {
-    const db = await open();
-    if (!db) { mem.delete(id); return; }
-    return new Promise((res) => {
-      const tx = db.transaction('images', 'readwrite');
-      tx.objectStore('images').delete(id);
-      tx.oncomplete = () => res(); tx.onerror = () => res();
-    });
-  }
-  return { put, get, all, del };
-})();
-
-export const imageURLs = new Map();
+/* ---------- images ---------- */
+/* Images are { kind: 'url', url } or { kind: 'none' }. Kept async so existing {#await imageSrc(...)} markup still works. */
 export async function imageSrc(image) {
-  if (!image || image.kind === 'none') return null;
-  if (image.kind === 'url') return image.url || null;
-  if (image.kind === 'upload') {
-    if (imageURLs.has(image.id)) return imageURLs.get(image.id);
-    try {
-      const rec = await ImgDB.get(image.id);
-      if (rec?.blob) { const u = URL.createObjectURL(rec.blob); imageURLs.set(image.id, u); return u; }
-    } catch { /* ignore */ }
-  }
-  return null;
+  if (!image || image.kind !== 'url') return null;
+  return image.url || null;
 }
 
 /* Image key used for texture / cache lookups. Stable per image identity. */
 export function imageKey(image) {
   if (!image || image.kind === 'none') return 'none';
-  if (image.kind === 'upload') return 'u:' + image.id;
   return image.url || '';
 }
 
@@ -233,25 +169,105 @@ export function defaultState() {
 /* =========================================================
    REACTIVE STATE
    ========================================================= */
-export function loadStore() {
-  let s = LS.get(K_STORE, null);
-  if (!s || !s.products) s = defaultState();
-  if (!s.layout) s.layout = defaultState().layout;
-  if (!s.banners) s.banners = [];
-  if (!s.promo) s.promo = defaultState().promo;
-  if (!s.settings) s.settings = defaultState().settings;
-  s.ai = normalizeAI(s.ai);
-  if (!s.orders) s.orders = [];
-  if (!s.layout.assignments) s.layout.assignments = {};
-  s.categories.forEach((c) => { delete c.icon; });
-  /* migrate single-image products → images[] */
-  s.products.forEach((p) => {
-    if (!Array.isArray(p.images)) {
-      p.images = (p.image && p.image.kind !== 'none') ? [JSON.parse(JSON.stringify(p.image))] : [];
+/* Rebuilds the store object the pages use from the database tables. */
+const asImages = (urls) => (urls || []).map((url) => ({ kind: 'url', url }));
+const firstImage = (imgs) => imgs[0] ? { ...imgs[0] } : { kind: 'none' };
+
+export async function loadStore() {
+  const q = (t, sel = '*') => supabase.from(t).select(sel);
+  const [cats, prods, bans, atts, sc, ac] = await Promise.all([
+    q('categories').order('sort_order'),
+    q('products').order('created_at'),
+    q('banners').order('created_at'),
+    q('attachments').order('position'),
+    q('store_config').maybeSingle(),
+    q('ai_config').maybeSingle()
+  ]);
+  for (const r of [cats, prods, bans, atts, sc, ac]) if (r.error) throw new Error(r.error.message);
+
+  console.log(cats, prods, bans, atts, sc, ac)
+
+  const byProduct = new Map(), byBanner = new Map();
+  for (const a of atts.data) {
+    const m = a.product_id ? byProduct : byBanner, k = a.product_id || a.banner_id;
+    if (!k) continue;
+    if (!m.has(k)) m.set(k, []);
+    m.get(k).push(a.url);
+  }
+
+  const assignments = {};
+  cats.data.forEach((c) => { if (c.aisle !== null && c.aisle !== undefined) assignments[c.id] = c.aisle; });
+
+  const products = prods.data.map((p) => {
+    const images = asImages(byProduct.get(p.id));
+    const out = {
+      id: p.id, name: p.name, brand: p.brand || '', price: p.price, categoryId: p.category_id,
+      shape: p.shape, color: p.color, imageType: p.image_type, enabled: p.enabled, published: p.published,
+      placement: p.placement || { mode: 'auto' }, images, image: firstImage(images)
+    };
+    if (p.draft) {
+      const dImages = asImages(p.draft.images);
+      out.draft = { ...p.draft, id: p.id, published: p.published, images: dImages, image: firstImage(dImages) };
     }
-    if (!p.image) p.image = p.images[0] || { kind: 'none' };
+    return out;
   });
-  return s;
+
+  const banners = bans.data.map((b) => {
+    const imgs = asImages(byBanner.get(b.id));
+    return {
+      id: b.id, name: b.name, headline: b.headline || '', sub: b.sub || '', cta: b.cta || '', url: b.url || '',
+      bg: b.bg, priority: b.priority, placements: b.placements || [], enabled: b.enabled, published: b.published,
+      image: firstImage(imgs)
+    };
+  });
+
+  const d = defaultState();
+  const c = sc.data, a = ac.data;
+  return {
+    version: 1,
+    categories: cats.data.map((x) => ({ id: x.id, name: x.name })),
+    products,
+    banners,
+    layout: { aisleCount: c?.aisle_count ?? d.layout.aisleCount, checkout: c?.checkout ?? d.layout.checkout, assignments },
+    promo: c ? { enabled: c.promo_enabled, message: c.promo_message || '', label: c.promo_label || '', url: c.promo_url || '' } : d.promo,
+    settings: c ? { muted: c.muted, volume: Number(c.volume) } : d.settings,
+    ai: normalizeAI(a ? {
+      enabled: a.enabled, showTags: a.show_tags, maxShoppers: a.max_shoppers, spawnMin: Number(a.spawn_min), spawnMax: Number(a.spawn_max),
+      walkSpeed: Number(a.walk_speed), maxAisles: a.max_aisles, maxItemsPerAisle: a.max_items_per_aisle, maxShopTime: a.max_shop_time,
+      names: a.names, cartColors: a.cart_colors, profiles: a.profiles
+    } : undefined),
+    orders: []
+  };
+}
+
+/* Admin only. Posts the store to /api/store; the server verifies the token and is_admin. Returns { ok, idMap, skippedImages }. */
+export async function saveStore(store) {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session) throw new Error('Not signed in');
+  const res = await fetch('/api/store', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + session.access_token },
+    body: JSON.stringify(store)
+  });
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(out.message || 'Save failed (' + res.status + ')');
+  return out;
+}
+
+/* After a save, swap the temporary ids the admin created for the real UUIDs the server assigned. */
+export function applyIdMap(store, idMap) {
+  if (!idMap || !Object.keys(idMap).length) return store;
+  const m = (id) => idMap[id] || id;
+  store.categories.forEach((c) => { c.id = m(c.id); });
+  store.products.forEach((p) => {
+    p.id = m(p.id); p.categoryId = m(p.categoryId);
+    if (p.draft) { p.draft.id = p.id; p.draft.categoryId = m(p.draft.categoryId); }
+  });
+  store.banners.forEach((b) => { b.id = m(b.id); });
+  const next = {};
+  for (const [k, v] of Object.entries(store.layout?.assignments || {})) next[m(k)] = v;
+  if (store.layout) store.layout.assignments = next;
+  return store;
 }
 
 export function loadCart() {
@@ -268,21 +284,5 @@ export function safeUrl(u) {
   return null;
 }
 
-export function blobToBase64(blob) {
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload = () => res(String(r.result).split(',')[1] || '');
-    r.onerror = () => rej(r.error);
-    r.readAsDataURL(blob);
-  });
-}
-export function base64ToBlob(b64, mime) {
-  const bin = atob(b64);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return new Blob([arr], { type: mime || 'image/png' });
-}
-
-/* ---------- persistence (swap these for API calls when moving to the server) ---------- */
-export function saveStoreData(snapshot) { return LS.set(K_STORE, snapshot); }
+/* ---------- cart persistence (stays on the device) ---------- */
 export function saveCartData(snapshot) { return LS.set(K_CART, snapshot); }

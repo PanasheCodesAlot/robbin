@@ -1,7 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 
-const PUBLIC_SUPABASE_URL = 'https://nxkqcretouzdiwammdzq.supabase.co'
-const PUBLIC_SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_f11GIxIGV-Id1M16UJ0AYQ_Oh6CoRot'
+const PUBLIC_SUPABASE_URL = '...'
+const PUBLIC_SUPABASE_PUBLISHABLE_KEY = '...'
 
 if (!PUBLIC_SUPABASE_URL || !PUBLIC_SUPABASE_PUBLISHABLE_KEY) {
   throw new Error('Missing PUBLIC_SUPABASE_URL or PUBLIC_SUPABASE_PUBLISHABLE_KEY');

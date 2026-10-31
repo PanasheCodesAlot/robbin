@@ -45,7 +45,7 @@
     { icon: '👆', title: 'Swipe to look', text: 'Swipe the view to look up and down. Swipes never trigger taps.' },
     { icon: '🛒', title: 'Tap products', text: 'Products face you on the shelves. Tap one to open its card.' },
     { icon: '➕', title: 'Add to cart', text: 'Choose quantity and add. Items drop into your basket.' },
-    { icon: '💳', title: 'Check out', text: 'Tap the cart top-right when ready. Payment is simulated.' }
+    { icon: '💳', title: 'Check out', text: 'Tap the cart top-right when ready' }
   ];
 
   /* =========================================================
@@ -2067,8 +2067,6 @@
         <button onclick={() => closeSheet('paySheet')} class="w-8 h-8 rounded-full border border-[#e3e7e4] bg-white flex items-center justify-center text-[#5a6662]"><X size={16} /></button>
       </div>
       <div class="bg-[#fdf7e8] border border-[#f0e2bf] rounded-xl p-3 mb-4">
-        <div class="text-[11.5px] text-[#7a5a12] font-bold">DEMONSTRATION ONLY</div>
-        <div class="text-[11.5px] text-[#7a5a12]">This is a simulated payment. No real card details are collected and no money is charged.</div>
       </div>
       <div class="flex justify-between py-3 text-[17px] font-extrabold border-t border-b border-[#e3e7e4]" style=""><span>Amount</span><span>{fmt(cartTotal)}</span></div>
       <div class="mt-4 mb-3">
